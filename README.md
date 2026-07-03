@@ -20,11 +20,6 @@ LogVar 弹幕 API 服务器
 
 一个人人都能部署的基于 js 的弹幕 API 服务器，支持爱优腾芒哔咪人韩巴狐乐西埋帆弹幕直接获取，兼容弹弹play的搜索、详情查询和弹幕获取接口规范，并提供日志记录，支持vercel/netlify/edgeone/cloudflare/docker/hf等部署方式，不用提前下载弹幕，没有nas或小鸡也能一键部署。
 
-本项目仅为个人学习爱好开发，代码开源。如有任何侵权行为，请联系本人删除。
-
-有问题提issue或 [私信机器人](https://t.me/ddjdd_bot) 都ok。
-
-新加了 [tg频道](https://t.me/logvar_danmu_channel) ，方便发送更新通知，以及群组，太多人私信咨询了，索性增加一个 [互助群](https://t.me/logvar_danmu_group) ，大家有问题可以在群里求助。
 
 > 请不要在国内媒体平台宣传本项目！
 
