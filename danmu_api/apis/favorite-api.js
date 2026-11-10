@@ -21,9 +21,7 @@ async function resolveTitleForFavorite(fileName) {
   const { cleanFileName } = parseFileName(fileName);
   let { title, season, episode, year } = await extractTitleSeasonEpisode(cleanFileName);
 
-  if (globals.titleMappingTable && globals.titleMappingTable.size > 0) {
-    title = globals.titleMappingTable.get(title) || title;
-  }
+  title = globals.resolveTitleMapping(title) || title;
   if (globals.animeTitleSimplified) title = simplized(title);
   if (globals.titleNoiseFilter) title = title.replace(globals.titleNoiseFilter, '').trim();
 
@@ -122,14 +120,21 @@ export async function handleFavoriteAdd(req, url) {
       isFavorite: true
     });
   } catch (error) {
-    log('error', `[favorite] add failed: ${error.message}`);
+    log('error', `[system] [favorite] add failed: ${error.message}`);
     return jsonResponse({ success: false, message: `收藏失败: ${error.message}` }, 500);
   }
 }
 
 export function handleFavoriteList() {
+  // Node/Docker 可以使用本地文件缓存；无持久化存储的 serverless 实例
+  // 会在冷启动或实例切换后丢失收藏，因此不向前端开放收藏写入按钮。
+  const favoriteSupported = globals.deployPlatform === 'node' || globals.redisValid === true;
   return jsonResponse({
     success: true,
+    favoriteSupported,
+    favoriteSupportMessage: favoriteSupported
+      ? ''
+      : '当前云部署未配置 Redis，收藏功能不可用。请配置 UPSTASH_REDIS_REST_URL 和 UPSTASH_REDIS_REST_TOKEN 后重新部署。',
     scheduledRefreshSupported: globals.deployPlatform === 'node',
     favorites: listFavorites()
   });
@@ -164,7 +169,7 @@ export async function handleFavoriteSchedule(req) {
       refreshSchedule: created.value
     });
   } catch (error) {
-    log('error', `[favorite] schedule failed: ${error.message}`);
+    log('error', `[system] [favorite] schedule failed: ${error.message}`);
     return jsonResponse({ success: false, message: `设置定时刷新失败: ${error.message}` }, 500);
   }
 }
@@ -189,7 +194,7 @@ export async function handleFavoriteRemove(req) {
     await persistFavorites();
     return jsonResponse({ success: true, message: '已删除收藏' });
   } catch (error) {
-    log('error', `[favorite] remove failed: ${error.message}`);
+    log('error', `[system] [favorite] remove failed: ${error.message}`);
     return jsonResponse({ success: false, message: `删除收藏失败: ${error.message}` }, 500);
   }
 }
@@ -277,7 +282,7 @@ export async function handleFavoriteRefresh(req, url) {
     }
     return jsonResponse({ success: true, message: `已刷新收藏「${result.animeTitle}」` });
   } catch (error) {
-    log('error', `[favorite] refresh failed: ${error.message}`);
+    log('error', `[system] [favorite] refresh failed: ${error.message}`);
     return jsonResponse({ success: false, message: `刷新收藏失败: ${error.message}` }, error.status || 500);
   }
 }

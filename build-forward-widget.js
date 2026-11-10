@@ -47,6 +47,8 @@ const forwardRuntimeCompatPlugin = {
   name: 'forward-runtime-compat',
   setup(build) {
     const danAnyModulePath = path.resolve('danmu_api/utils/dan-any.js');
+    const localSourceModulePath = path.resolve('danmu_api/sources/local.js');
+    const localStoreModulePath = path.resolve('danmu_api/utils/local-danmu-store.js');
 
     // Forward only consumes the native JSON/XML response paths. Keep dan-any
     // available to the server while removing it and its transitive dependencies
@@ -56,8 +58,25 @@ const forwardRuntimeCompatPlugin = {
       return { path: 'dan-any', namespace: 'forward-optional-modules' };
     });
 
+    // Uploaded files belong to the API server's filesystem/Redis. Forward has
+    // no access to that storage; keep it out of the standalone widget bundle.
+    build.onResolve({ filter: /(?:^|[\\/])(?:local|local-danmu-store)\.js$/ }, (args) => {
+      const modulePath = path.resolve(args.resolveDir, args.path);
+      if (modulePath === localSourceModulePath) {
+        return { path: 'local-source', namespace: 'forward-optional-modules' };
+      }
+      if (modulePath === localStoreModulePath) {
+        return { path: 'local-store', namespace: 'forward-optional-modules' };
+      }
+    });
+
     build.onResolve({ filter: /^node:async_hooks$/ }, () => ({
       path: 'async-hooks',
+      namespace: 'forward-node-builtins'
+    }));
+
+    build.onResolve({ filter: /^node:(?:http|https)$/ }, (args) => ({
+      path: args.path.slice('node:'.length),
       namespace: 'forward-node-builtins'
     }));
 
@@ -93,6 +112,11 @@ const forwardRuntimeCompatPlugin = {
       `
     }));
 
+    build.onLoad({ filter: /^(?:http|https)$/, namespace: 'forward-node-builtins' }, () => ({
+      loader: 'js',
+      contents: `export default { Agent: class Agent {} };`
+    }));
+
     build.onLoad({ filter: /^dan-any$/, namespace: 'forward-optional-modules' }, () => ({
       loader: 'js',
       contents: `
@@ -101,6 +125,25 @@ const forwardRuntimeCompatPlugin = {
           return null;
         }
       `
+    }));
+
+    build.onLoad({ filter: /^local-source$/, namespace: 'forward-optional-modules' }, () => ({
+      loader: 'js',
+      contents: `
+        export default class LocalSource {
+          async search() { return []; }
+          async handleAnimes() { return []; }
+          async getComments(id, sourceName = 'local', segmentFlag = false) {
+            return segmentFlag ? { type: 'local', segmentList: [], duration: 0 } : [];
+          }
+          async getSegmentComments() { return []; }
+        }
+      `
+    }));
+
+    build.onLoad({ filter: /^local-store$/, namespace: 'forward-optional-modules' }, () => ({
+      loader: 'js',
+      contents: `export async function findLocalDanmu() { return null; }`
     }));
   }
 };
@@ -117,7 +160,7 @@ const forwardRuntimeCompatPlugin = {
       target: 'es2020',
       outfile: outputFile,
       format: 'esm', // 保持ES模块格式
-      external: ['redis', 'fs', 'path', 'stream/promises', 'node-fetch'],
+      external: ['redis', 'fs', 'path', 'stream/promises', 'node-fetch', 'node:path', 'node:fs/promises'],
       plugins: [
         forwardRuntimeCompatPlugin,
         // 插件：排除UI相关模块
@@ -176,6 +219,7 @@ const forwardRuntimeCompatPlugin = {
       ],
       define: {
         'widgetVersion': `"${Globals.VERSION}"`,
+        'globalThis.__FORWARD_WIDGET__': 'true',
         'globalThis.__FORWARD_WIDGET_DEBUG__': debugBuild ? 'true' : 'false'
       },
       banner: {

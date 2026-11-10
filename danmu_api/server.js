@@ -9,12 +9,22 @@ import { HttpsProxyAgent } from 'https-proxy-agent';
 import dotenv from 'dotenv';
 import { Request as NodeFetchRequest } from 'node-fetch';
 import { handleRequest } from './worker.js';
-import { Globals } from './configs/globals.js';
-import { clearBangumiDataCache, initBangumiData } from './utils/bangumi-data-util.js';
-import { getLocalCaches, judgeLocalCacheValid } from './utils/cache-util.js';
-import { getRedisCaches, judgeRedisValid } from './utils/redis-util.js';
+import { Globals, globals } from './configs/globals.js';
+import { Envs } from './configs/envs.js';
+import { clearBangumiDataCache, initBangumiData, syncBangumiDataLifecycleOnConfigChange } from './utils/bangumi-data-util.js';
+import { judgeRedisValid, initializePersistentCaches } from './utils/redis-util.js';
 import { persistFavorites, refreshFavoriteByKeyword } from './apis/favorite-api.js';
 import { startFavoriteScheduler, stopFavoriteScheduler } from './utils/favorite-schedule-util.js';
+import { formatHostForUrl, listenOnAllInterfaces } from './utils/server-listen-util.js';
+import { ensureRemoteTitleMapping } from './utils/remote-title-mapping-util.js';
+import { ensureRemoteAutoMatchMapping } from './utils/auto-match-mapping-url-util.js';
+
+// 读取 Node HTTP 请求体的原始字节，避免多字节字符和上传文件在分块读取时被破坏。
+async function readRequestBody(req) {
+  const chunks = [];
+  for await (const chunk of req) chunks.push(chunk);
+  return Buffer.concat(chunks);
+}
 
 // =====================
 // server.js - 本地node智能启动脚本：根据 Node.js 环境自动选择最优启动模式
@@ -40,6 +50,9 @@ const envPath = path.join(configDir, '.env');
 
 // 保存系统环境变量的副本，确保它们具有最高优先级
 const systemEnvBackup = { ...process.env };
+
+// 注入到 Envs，供自定义规则变量读取时判定系统环境变量优先级（绕过 dotenv 注释截断）
+Envs.systemEnvBackup = systemEnvBackup;
 
 
 // 引入 zlib 模块，用于响应数据的 GZIP 压缩
@@ -137,6 +150,15 @@ function loadEnv() {
       process.env[key] = value;
     }
 
+    // 解析 .env 原始内容，供支持自定义规则的变量绕过 dotenv 注释截断（保留 # 等字符）
+    try {
+      if (fs.existsSync(envPath)) {
+        Envs.rawEnvValues = Envs.parseRawEnvText(fs.readFileSync(envPath, 'utf8'));
+      }
+    } catch (e) {
+      // 原始解析失败不影响启动，相关变量回退到普通取值语义
+    }
+
     console.log('[server] .env file loaded successfully');
   } catch (e) {
     console.log('[server] dotenv not available or .env file not found, using system environment variables');
@@ -220,10 +242,14 @@ async function setupEnvWatcher() {
           console.log('[server] Environment variables reloaded successfully');
           console.log('[server] Updated keys:', Array.from(newEnvKeys).join(', '));
 
-          // 如果检测到关闭了 Bangumi Data 功能，主动释放内存与物理磁盘缓存
-          if (process.env.USE_BANGUMI_DATA === 'false' || process.env.USE_BANGUMI_DATA === false) {
-              clearBangumiDataCache(true);
-          }
+          globals.reInit();
+          void ensureRemoteAutoMatchMapping();
+
+          // 配置变更后同步 Bangumi Data 生命周期：开启则立即确保缓存就绪（缺失则下载），
+          // 关闭则释放缓存；先按真实配置同步内存开关，避免重载未刷新 globals 时状态滞后
+          const bangumiEnabled = process.env.USE_BANGUMI_DATA === 'true' || process.env.USE_BANGUMI_DATA === true;
+          globals.useBangumiData = bangumiEnabled;
+          syncBangumiDataLifecycleOnConfigChange('node');
 
         } catch (error) {
           console.log('[server] Error reloading configuration files:', error.message);
@@ -252,7 +278,7 @@ async function setupEnvWatcher() {
 /**
  * 优雅关闭：清理文件监听器并关闭服务器
  */
-function cleanupWatcher() {
+function cleanupWatcher(exitCode = 0) {
   stopFavoriteScheduler();
   if (envWatcher) {
     console.log('[server] Closing file watcher...');
@@ -264,14 +290,14 @@ function cleanupWatcher() {
     reloadTimer = null;
   }
   // 优雅关闭主服务器
-  if (mainServer) {
+  if (mainServer?.listening) {
     console.log('[server] Closing main server...');
     mainServer.close(() => {
       console.log('[server] Main server closed');
     });
   }
   // 优雅关闭代理服务器
-  if (proxyServer) {
+  if (proxyServer?.listening) {
     console.log('[server] Closing proxy server...');
     proxyServer.close(() => {
       console.log('[server] Proxy server closed');
@@ -280,13 +306,13 @@ function cleanupWatcher() {
   // 给服务器一点时间关闭后退出
   setTimeout(() => {
     console.log('[server] Exit complete.');
-    process.exit(0);
+    process.exit(exitCode);
   }, 500);
 }
 
 // 监听进程退出信号
-process.on('SIGTERM', cleanupWatcher);
-process.on('SIGINT', cleanupWatcher);
+process.on('SIGTERM', () => cleanupWatcher(0));
+process.on('SIGINT', () => cleanupWatcher(0));
 
 /**
  * 创建主业务服务器实例 (默认端口 9321，可通过 DANMU_API_PORT 配置)
@@ -324,12 +350,8 @@ function createServer() {
 
       // 异步读取 POST/PUT 请求的请求体
       let body;
-      if (req.method === 'POST' || req.method === 'PUT') {
-        body = await new Promise((resolve) => {
-          let data = '';
-          req.on('data', chunk => data += chunk);
-          req.on('end', () => resolve(data));
-        });
+      if (req.method === 'POST' || req.method === 'PUT' || req.method === 'PATCH') {
+        body = await readRequestBody(req);
       }
 
       // 创建一个 Web API 兼容的 Request 对象
@@ -413,9 +435,9 @@ function createProxyServer() {
           if (/^@/.test(config) || /^[\w-]+@http/i.test(config)) {
             continue;
           }
-          // 正向代理：http://proxy.com:port 或 socks5://proxy.com:port
+          // 正向代理：http://proxy.com:port 或 https://proxy.com:port
           forwardProxy = config.trim();
-          console.log('[Proxy Server] Forward proxy detected:', forwardProxy);
+          console.log('[Proxy Server] Forward proxy detected');
           // 找到第一个有效代理就停止，避免逻辑混乱
           break; 
         }
@@ -428,7 +450,7 @@ function createProxyServer() {
         hostname: originalUrlObj.hostname,
         port: originalUrlObj.port || (originalUrlObj.protocol === 'https:' ? 443 : 80),
         path: originalUrlObj.pathname + originalUrlObj.search,
-        method: 'GET',
+        method: req.method,
         headers: { ...req.headers } // 传递原始请求头
       };
       
@@ -440,7 +462,7 @@ function createProxyServer() {
       // 处理正向代理逻辑
       if (forwardProxy) {
         // 正向代理模式：使用 HttpsProxyAgent
-        console.log('[Proxy Server] Using forward proxy agent:', forwardProxy);
+        console.log('[Proxy Server] Using forward proxy agent');
         options.agent = new HttpsProxyAgent(forwardProxy);
       } else {
         // 直连模式
@@ -452,9 +474,8 @@ function createProxyServer() {
         proxyRes.pipe(res, { end: true });
       });
 
-      // 监听外部触发中断
-      // 当外部触发 abort() 时，这里的 req 会触发 'close'掐断 proxyReq
-      req.on('close', () => {
+      // 客户端响应连接断开时中断上游；请求体读完也会触发 req.close，不能据此取消 POST。
+      res.on('close', () => {
         if (!res.writableEnded) {
           console.log('[Proxy Server] Client disconnected prematurely. Destroying upstream request.');
           proxyReq.destroy();
@@ -462,8 +483,8 @@ function createProxyServer() {
       });
 
       proxyReq.on('error', (err) => {
-        // 过滤掉因外部主动断开导致的 ECONNRESET / socket hang up 错误
-        if (req.destroyed || req.aborted || err.code === 'ECONNRESET' || err.message === 'socket hang up') {
+        // 仅忽略客户端主动断开，正常请求的上游错误仍需返回响应。
+        if (res.destroyed || req.aborted) {
             // 只有当响应还没结束时，才打印一条 Info 级别的日志，证明熔断成功
             if (!res.writableEnded) {
                 console.log('[Proxy Server] Upstream connection closed (expected behavior due to client interrupt).');
@@ -478,7 +499,7 @@ function createProxyServer() {
         }
       });
 
-      proxyReq.end();
+      req.pipe(proxyReq);
     } else {
       res.statusCode = 400;
       res.end('Bad Request: Missing URL parameter');
@@ -507,31 +528,37 @@ async function startServer() {
   const configuredMainPort = Number.parseInt(process.env.DANMU_API_PORT ?? '', 10);
   const mainPort = Number.isNaN(configuredMainPort) ? 9321 : configuredMainPort;
   mainServer = createServer();
-  mainServer.listen(mainPort, '0.0.0.0', () => {
-    console.log(`Server running on http://0.0.0.0:${mainPort}`);
-    if (detectNodeDeployPlatform() === 'node') {
-      initializeFavoriteScheduler(mainPort).catch(error => {
-        console.error('[server] Favorite scheduler initialization failed:', error.message);
-      });
-    }
+  const mainBinding = await listenOnAllInterfaces(mainServer, mainPort, {
+    serviceName: 'main server'
   });
+  console.log(`Server running on http://${formatHostForUrl(mainBinding.address)}:${mainBinding.port}`);
+  if (detectNodeDeployPlatform() === 'node') {
+    initializeNodeServices(mainPort).catch(error => {
+      console.error('[server] Node background services initialization failed:', error.message);
+    });
+  }
 
   // 启动5321端口的代理服务
   proxyServer = createProxyServer();
-  proxyServer.listen(5321, '0.0.0.0', () => {
-    console.log('Proxy server running on http://0.0.0.0:5321');
-
-    // 异步初始化 Bangumi Data 缓存
-    setTimeout(() => initBangumiData('node', true).catch(console.error), 1000);
+  const proxyBinding = await listenOnAllInterfaces(proxyServer, 5321, {
+    serviceName: 'proxy server'
   });
+  console.log(`Proxy server running on http://${formatHostForUrl(proxyBinding.address)}:${proxyBinding.port}`);
+
+  // 异步初始化 Bangumi Data 缓存
+  setTimeout(() => initBangumiData('node', true).catch(console.error), 1000);
+}
+
+async function initializeNodeServices(mainPort) {
+  Globals.deployPlatform = 'node';
+  await ensureRemoteTitleMapping();
+  await ensureRemoteAutoMatchMapping();
+  await initializeFavoriteScheduler(mainPort);
 }
 
 async function initializeFavoriteScheduler(mainPort) {
-  await judgeLocalCacheValid('/api/v2/favorite/list', 'node');
-  if (Globals.localCacheValid) await getLocalCaches();
-
   await judgeRedisValid('/api/v2/favorite/list');
-  if (Globals.redisValid) await getRedisCaches();
+  await initializePersistentCaches('node');
 
   const refreshUrl = new URL(`http://127.0.0.1:${mainPort}/api/v2/favorite/refresh`);
   await startFavoriteScheduler({
@@ -542,4 +569,7 @@ async function initializeFavoriteScheduler(mainPort) {
 }
 
 // 启动
-startServer();
+startServer().catch(error => {
+  console.error('[server] Failed to start server:', error);
+  cleanupWatcher(1);
+});

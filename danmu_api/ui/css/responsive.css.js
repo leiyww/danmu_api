@@ -24,13 +24,14 @@ export const responsiveCssContent = /* css */ `
         box-shadow: var(--app-shadow-md);
     }
 
-    .header {
-        padding: 12px 14px;
+    :root {
+        --header-pad-y: 12px;
+        --header-pad-x: 14px;
+        --logo-size: 36px;
+        --title-size: 21px;
     }
 
     .logo {
-        width: 36px;
-        height: 36px;
         font-size: 20px;
         border-radius: 10px;
     }
@@ -46,11 +47,6 @@ export const responsiveCssContent = /* css */ `
         flex-direction: row;
         align-items: center;
         gap: 8px;
-    }
-
-    .header h1 {
-        font-size: 19px;
-        margin: 0;
     }
 
     .version-info {
@@ -123,11 +119,16 @@ export const responsiveCssContent = /* css */ `
         justify-content: space-between;
     }
 
+    /* 总览的宽度与下方选项一致 */
     .preview-back-btn {
-        grid-column: 1 / -1;
-        width: calc((100% - 10px) / 3);
-        min-width: 0;
-        justify-self: start;
+        grid-column: 1;
+    }
+
+    /* 四项并排（8 项两行排完）时总览与选项同行；容纳不下第四列、需要第三行时才独占一行。534px 为实测临界宽度 */
+    @media (max-width: 534px) {
+        .preview-back-btn + .preview-category-btn {
+            grid-column: 1;
+        }
     }
 
     .preview-search {
@@ -213,10 +214,6 @@ export const responsiveCssContent = /* css */ `
 
 /* ============ 小屏手机 (<= 480px) ============ */
 @media (max-width: 480px) {
-    .header h1 {
-        font-size: 18px;
-    }
-
     .nav-btn {
         flex: 1 1 calc(33.333% - 4px);
         font-size: 11px;
@@ -236,6 +233,50 @@ export const responsiveCssContent = /* css */ `
     .modal-content {
         padding: 20px;
         border-radius: 16px;
+    }
+}
+
+.search-actions {
+    display: flex;
+    gap: 10px;
+    margin-top: 5px;
+    flex-wrap: wrap;
+}
+
+/* 手机端：输入框独占第一行，收藏和搜索按钮并排 */
+@media (max-width: 500px) {
+    .search-actions input {
+        flex-basis: 100%;
+        min-width: 100%;
+        order: 1;
+    }
+    .search-actions .favorite-action-btn {
+        flex: 1;
+        order: 2;
+    }
+    .search-actions #manual-search-btn {
+        flex: 1;
+        order: 3;
+    }
+}
+
+/* 剧集操作按钮：PC 窄 120px、平板适中 160px、手机窄 100px */
+.episode-item .btn,
+.jump-episode-btn {
+    max-width: 120px;
+}
+
+@media (min-width: 501px) and (max-width: 768px) {
+    .episode-item .btn,
+    .jump-episode-btn {
+        max-width: 160px;
+    }
+}
+
+@media (max-width: 500px) {
+    .episode-item .btn,
+    .jump-episode-btn {
+        max-width: 100px;
     }
 }
 `;

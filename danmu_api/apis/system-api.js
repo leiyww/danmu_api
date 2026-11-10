@@ -1,7 +1,10 @@
 import { globals } from "../configs/globals.js";
+import { getEpisodeIdFloor, queryCacheKeys } from "../utils/cache-util.js";
 import { jsonResponse } from "../utils/http-util.js";
 import { HTML_TEMPLATE } from "../ui/template.js";
 import { formatLogMessage, log } from "../utils/log-util.js";
+import { refreshRemoteTitleMappingNow } from "../utils/remote-title-mapping-util.js";
+import { refreshRemoteAutoMatchMappingNow } from "../utils/auto-match-mapping-url-util.js";
 import { HandlerFactory } from "../configs/handlers/handler-factory.js";
 import { clearBangumiDataCache, initBangumiData } from "../utils/bangumi-data-util.js";
 
@@ -15,9 +18,14 @@ function resolveUiTheme(theme) {
 }
 
 export function handleUI() {
+  const localDanmuCanUpload = globals.localDanmuNotRequireAdmin
+    || (!!globals.adminToken && globals.currentToken === globals.adminToken);
   const html = HTML_TEMPLATE
     .replace("globals.currentToken", () => globals.currentToken)
-    .replace("globals.uiTheme", resolveUiTheme(globals.uiTheme));
+    .replace("globals.uiTheme", resolveUiTheme(globals.uiTheme))
+    .replace("globals.localDanmuCanUpload", String(localDanmuCanUpload))
+    .replace("globals.localDanmuRedisValid", String(globals.redisValid === true))
+    .replace("globals.localDanmuIsCloud", String(Boolean(globals.deployPlatform && globals.deployPlatform.toLowerCase() !== 'node')));
 
   return new Response(html, {
     headers: {
@@ -158,6 +166,20 @@ export function handleLogs() {
   return new Response(processedLogText, { headers: { "Content-Type": "text/plain; charset=utf-8" } });
 }
 
+/** 管理员手动刷新远程映射表 */
+export async function handleRemoteMappingRefresh() {
+  const result = await refreshRemoteTitleMappingNow();
+  const { status, ...body } = result;
+  return jsonResponse(body, status);
+}
+
+/** 管理员手动刷新远程季集映射表 */
+export async function handleRemoteAutoMatchMappingRefresh() {
+  const result = await refreshRemoteAutoMatchMappingNow();
+  const { status, ...body } = result;
+  return jsonResponse(body, status);
+}
+
 /**
  * 处理清除日志的请求
  * @returns {Response} 表示操作成功的响应
@@ -169,85 +191,113 @@ export function handleClearLogs() {
 
 /**
  * 处理清理缓存的请求
- * @returns {Response} 表示操作成功的响应
+ * @param {Request} [req] 可选请求体 { items: string[] }，用于指定待清理项；未提供时清理全部已知项
+ * @returns {Response} 表示操作结果的响应
  */
-export async function handleClearCache() {
- try {
-    // 清理 globals 中的缓存数据
-    globals.animes = [];
-    globals.episodeIds = [];
-    globals.episodeNum = 10001; // 重置为初始值
-    globals.lastSelectMap = new Map(); // 重新创建 Map 对象
-    globals.reqRecords = []; // 清空请求记录
-    globals.todayReqNum = 0; // 重置今日请求次数
-    
+export async function handleClearCache(req) {
+  // 各清理项对应的重置逻辑；请求记录与今日计数归入「请求历史记录」项
+  const clearActions = {
+    animes: () => { globals.animes = []; },
+    episodeIds: () => { globals.episodeIds = []; },
+    episodeNum: () => {}, // 在所有选中项清理完毕后，按剩余引用重置
+    lastSelectMap: () => { globals.lastSelectMap = new Map(); }, // 重新创建 Map 对象
     // 清理搜索和弹幕缓存
-    globals.searchCache = new Map();
-    globals.commentCache = new Map();
-    globals.requestHistory = new Map();
-
-    try {
-      // 清理 Bangumi-Data 内存与磁盘缓存
-      clearBangumiDataCache(true);
-      
-      // 触发异步数据重载
-      if (globals.useBangumiData) {
-        initBangumiData(globals.deployPlatform, false).catch(e => {
-          log("warn", `[system] [server] Bangumi-Data background reload failed: ${e.message}`);
-        });
+    searchCache: () => { globals.searchCache = new Map(); },
+    commentCache: () => { globals.commentCache = new Map(); },
+    requestHistory: () => {
+      globals.requestHistory = new Map();
+      globals.reqRecords = []; // 清空请求记录
+      globals.todayReqNum = 0; // 重置今日请求次数
+    },
+    bangumiData: () => {
+      try {
+        clearBangumiDataCache(true); // 清理 Bangumi-Data 内存与磁盘缓存
+        if (globals.useBangumiData) {
+          // 触发异步数据重载
+          initBangumiData(globals.deployPlatform, false).catch(e => {
+            log("warn", `[system] [server] Bangumi-Data background reload failed: ${e.message}`);
+          });
+        }
+      } catch (e) {
+        log("error", `[system] [server] Failed to clear Bangumi-Data cache: ${e.message}`);
       }
+    }
+  };
+  const allItems = Object.keys(clearActions);
+
+  let effectiveItems;
+  if (req) {
+    let parsed = null;
+    try {
+      parsed = await req.json();
     } catch (e) {
-      log("error", `[system] [server] Failed to clear Bangumi-Data cache: ${e.message}`);
+      parsed = null;
     }
-    
-    log("info", `[system] [server] Memory cache cleared successfully`);
-    
-    // 同步清理本地缓存和Redis缓存
-    try {
-      // 如果本地缓存有效，更新本地缓存
-      if (globals.localCacheValid) {
-        const { updateLocalCaches } = await import("../utils/cache-util.js");
-        await updateLocalCaches();
-        log("info", `[system] [server] Local cache cleared successfully`);
-      }
-    } catch (localError) {
-      log("warn", `[system] [server] Local cache may not be available: ${localError.message}`);
-    }
-    
-    try {
-      // 如果Redis有效，更新Redis缓存
-      if (globals.redisValid) {
-        const { updateRedisCaches } = await import("../utils/redis-util.js");
-        await updateRedisCaches();
-        log("info", `[system] [server] Redis cache cleared successfully`);
-      }
-    } catch (redisError) {
-      log("warn", `[system] [server] Redis may not be available: ${redisError.message}`);
+    const items = parsed && Array.isArray(parsed.items) ? parsed.items : null;
+    // 仅保留自身属性键，排除 __proto__ 等原型链键，避免误放行导致整次清理失败
+    effectiveItems = items ? items.filter(key => Object.prototype.hasOwnProperty.call(clearActions, key)) : allItems;
+  } else {
+    effectiveItems = allItems;
+  }
+
+  try {
+    for (const key of effectiveItems) {
+      clearActions[key]();
     }
 
-    try {
-      // 如果本地Redis有效，更新本地Redis缓存
-      if (globals.localRedisValid) {
-        const { updateLocalRedisCaches } = await import("../utils/local-redis-util.js");
-        await updateLocalRedisCaches();
-        log("info", `[system] [server] LocalRedis cache cleared successfully`);
+    if (effectiveItems.includes('episodeNum')) globals.episodeNum = getEpisodeIdFloor();
+    log("info", `[system] [server] Memory cache cleared successfully`);
+
+    // 显式清理仅写选中键，不携带默认收藏或未读取的其他查询数据。
+    const keys = queryCacheKeys.filter(key => effectiveItems.includes(key)
+      || (effectiveItems.includes('requestHistory') && ['reqRecords', 'todayReqNum'].includes(key)));
+    const failedBackends = [];
+    const restartBackends = [];
+    if (keys.length) {
+      const targets = [
+        ['file', globals.localCacheValid && globals.localCacheEnabled !== false, async () => (await import('../utils/cache-util.js')).updateLocalCaches({ keys, force: true })],
+        ['upstash', globals.redisUrl && globals.redisToken, async () => (await import('../utils/redis-util.js')).updateRedisCaches({ keys, force: true, timeoutMs: 5000 })],
+        ['localRedis', globals.deployPlatform === 'node' && globals.localRedisUrl, async () => (await import('../utils/local-redis-util.js')).updateLocalRedisCaches({ keys, force: true, timeoutMs: 5000 })]
+      ];
+      // 各后端独立清理，网络等待不串行累加；按固定顺序汇总部分失败。
+      const results = await Promise.allSettled(targets.map(([, enabled, update]) => enabled ? update() : true));
+      for (const [index, [backend, enabled]] of targets.entries()) {
+        if (!enabled) continue;
+        try {
+          const result = results[index];
+          if (result.status === 'rejected') throw result.reason;
+          if (!result.value) throw new Error('保存未成功');
+          // 只有完整清除查询快照才可直接解除保护；部分清除后需重启重读剩余键。
+          if (keys.length === queryCacheKeys.length) globals.queryCacheWritable[backend] = true;
+          else if (globals.queryCacheWritable[backend] === false) restartBackends.push(backend);
+        } catch (error) {
+          failedBackends.push(backend);
+          log('warn', `[system] ${backend} 缓存清理保存失败: ${error.message}`);
+        }
       }
-    } catch (redisError) {
-      log("warn", `[system] [server] LocalRedis may not be available: ${redisError.message}`);
     }
-    
-    log("info", `[system] [server] All caches cleared successfully`);
-    return jsonResponse({ success: true, message: "Cache cleared successfully", clearedItems: {
-      animes: 0,
-      episodeIds: 0,
-      episodeNum: 10001,
-      lastSelectMap: 0,
-      searchCache: 0,
-      commentCache: 0,
-      requestHistory: 0,
-      reqRecords: 0,
-      todayReqNum: 0
-    }}, 200);
+
+    const clearedItems = {};
+    for (const key of effectiveItems) {
+      if (key === "requestHistory") {
+        clearedItems.requestHistory = 0;
+        clearedItems.reqRecords = 0;
+        clearedItems.todayReqNum = 0;
+      } else if (key === "episodeNum") {
+        clearedItems.episodeNum = globals.episodeNum;
+      } else {
+        clearedItems[key] = 0;
+      }
+    }
+
+    if (failedBackends.length) {
+      return jsonResponse({ success: false, message: `内存已清理，但 ${failedBackends.join(', ')} 保存失败；未保存的后端仍保留清理前数据，重启后会重新加载，请重试`, clearedItems, failedBackends }, 500);
+    }
+    const message = restartBackends.length
+      ? `选中项已清理；${restartBackends.join(', ')} 仍保护未恢复的其他缓存，重启后重新读取，或清理全部查询缓存解除保护`
+      : 'Cache cleared successfully';
+    log('info', `[system] ${message}`);
+    return jsonResponse({ success: true, message, clearedItems, restartRequired: restartBackends.length > 0 }, 200);
   } catch (error) {
     log("error", `[system] [server] Cache clear failed: ${error.message}`);
     return jsonResponse({ success: false, message: `Cache clear failed: ${error.message}` }, 500);
